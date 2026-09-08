@@ -578,3 +578,180 @@ encapsulation, validation rules, and future storage changes.
 needs only routing and JSON. A framework can help with larger applications,
 middleware ecosystems, or advanced binding, but adds concepts unnecessary
 for this project.
+
+## Stage 7: UDP telemetry transport
+
+### Architecture
+
+```text
+Simulator.Next -> runAPSender -> udp.Sender.Send -> UDP socket
+                                                   |
+                                                   v
+                                           localhost UDP receiver
+                                                   |
+                                                   v
+                                      Receiver output channel (validated telemetry)
+                                                   |
+                                                   v
+                                             splitTelemetry
+                                             /              \
+                                            v                v
+                                  Monitor.Run -> state     alert History.Record
+                                            \                /
+                                             v              v
+                                                  HTTP API
+```
+
+The runnable server binds its UDP receiver to `127.0.0.1:9000` and its HTTP
+server to `:8080`. Stage 3's in-process collector remains in the repository
+for learning and tests, but `cmd/server` no longer creates or starts it.
+
+### UDP sender
+
+`udp.Sender` holds a `*net.UDPConn`. `udp.NewSender(destination string)`
+resolves an address such as `127.0.0.1:9000` and calls `net.DialUDP`. This is a
+*connected UDP* socket: it sets one default peer address for `Write`, but does
+not create a TCP-style reliable connection or handshake.
+
+`(*Sender).Send` validates `model.Telemetry`, marshals it with `json.Marshal`,
+then calls `UDPConn.Write` to send one datagram. It returns address-resolution,
+validation, JSON-marshalling, or socket-write errors to its caller. Each AP
+sender goroutine owns a sender socket and logs send errors while continuing its
+periodic loop.
+
+### UDP receiver
+
+`udp.Listen(address, maxDatagramSize)` resolves and binds a socket with
+`net.ListenUDP`. `Receiver.Start(ctx)` creates the receive-only telemetry
+channel and starts one `receive` goroutine. The loop's blocking operation is
+`UDPConn.ReadFromUDP(buffer)`, which returns the byte count `n`, the sending
+`*net.UDPAddr`, and an error.
+
+Before each read, the receiver sets a 50 ms read deadline. UDP reads do not
+accept a context directly, so a deadline wakes the loop periodically; it sees
+`ctx.Err()` and exits on cancellation. The receive goroutine defers both
+socket closure and output-channel closure. Invalid packet errors are logged
+and skipped rather than terminating the service.
+
+### Datagram lifecycle
+
+For AP-01, `(*simulator.Simulator).Next` creates `model.Telemetry`.
+`runAPSender` passes it to `(*udp.Sender).Send`, which JSON-marshals it and
+calls `UDPConn.Write`. The OS puts the datagram through the localhost UDP
+network stack to the bound receiver socket. `(*udp.Receiver).receive` returns
+from `ReadFromUDP`, unmarshals `buffer[:n]`, calls `Telemetry.Validate`, and
+sends it to its output channel. `splitTelemetry` forwards one copy to
+`(*monitor.Monitor).Run`, which calls `(*Monitor).Update` to update state.
+
+### Buffer handling
+
+The receiver goroutine allocates one 4 KiB byte buffer before its loop. The
+`n` returned by `ReadFromUDP` tells exactly how many bytes in that buffer
+belong to the datagram, so JSON must decode `buffer[:n]`, not unused bytes
+left from previous reads. A datagram larger than the supplied buffer is
+truncated by the receive operation and its remainder is discarded; its JSON
+will normally fail to decode and be logged as malformed. Four KiB is ample for
+this small JSON telemetry format.
+
+### UDP versus TCP and packet loss
+
+UDP is connectionless and has low per-message overhead, but provides no
+delivery, ordering, or duplicate-suppression guarantee. TCP is a
+connection-oriented, reliable, ordered byte stream with retransmission and
+additional protocol/state overhead. TCP is preferable when every event must
+arrive in order, such as a financial command or configuration update.
+
+If one frequent telemetry datagram is lost, the monitor keeps the most recent
+previous state until the next sample arrives. That is acceptable for this
+latest-state dashboard because new samples replace old ones quickly. It would
+not be acceptable for a one-time safety shutdown command or billing event,
+where loss must be detected and recovered.
+
+### Concurrency and channel ownership
+
+Stage 7 networking starts one `runAPSender` goroutine per AP in `main`; each
+blocks on ticker events and exits on `ctx.Done`, closing its own sender socket.
+`Receiver.Start` starts one `receive` goroutine; it blocks in `ReadFromUDP`
+until a packet or deadline, exits after cancellation is observed, closes its
+socket, then closes its output channel. `splitTelemetry` starts one fan-out
+goroutine and closes its two downstream channels when input closes or context
+is cancelled.
+
+The receiver creates `chan model.Telemetry`, is its only sender, and is its
+only closer. `splitTelemetry` receives from it. The monitor receives one
+downstream channel; alert recording receives the other. Neither receiver nor
+monitor closes an upstream channel, which makes ownership safe and prevents
+send-on-closed panics.
+
+### Error handling and JSON wire format
+
+For a malformed UDP packet, `ReadFromUDP` succeeds, `json.Unmarshal` fails,
+the receiver logs the sender address and error, then continues its loop. A
+valid JSON packet with invalid telemetry similarly fails `Validate`, is logged,
+and is not forwarded. A later valid packet is still decoded and sent.
+
+JSON uses the Stage 1 struct tags as the wire contract. It is readable with
+tools, easy to debug, and fully supported by Go's standard library. Its costs
+are larger datagrams and parsing overhead versus binary formats. Protobuf or a
+similar binary schema could reduce size and improve efficiency later, but is
+not needed for this learning service.
+
+### Socket-level and HTTP boundary
+
+The application calls Go's `net` APIs, which use operating-system sockets. A
+UDP sender hands one datagram to the OS network stack; a receiver socket bound
+to an IP and port receives datagrams addressed to that endpoint. The receiver
+turns transport bytes back into telemetry before the monitor sees them.
+
+HTTP handlers only call `Monitor.Get` and `Monitor.List`; they do not know or
+care whether updates originated from UDP, a simulator, or a future transport.
+This `UDP -> monitor state` and `HTTP -> monitor state` boundary keeps network
+parsing out of handlers and map management out of transport code.
+
+### Design tradeoffs
+
+UDP is isolated in `internal/transport/udp`, so socket handling, JSON wire
+format, and datagram errors do not leak into simulators or the monitor. The
+simulator generates a value; it does not update shared state. The monitor owns
+state; it does not parse packets. No acknowledgements, retries, sequence
+numbers, or TCP fallback are added: these would be a reliability protocol
+beyond this project's deliberately lossy telemetry use case.
+
+### Stage 7 interview questions
+
+**How does UDP differ from TCP?** UDP sends independent, best-effort datagrams;
+TCP provides a reliable ordered byte stream with connection state.
+
+**What is a datagram?** A self-contained message with boundaries preserved by
+UDP, unlike a TCP stream where applications frame messages themselves.
+
+**What does binding a socket mean?** Reserving a local IP address and port so
+the OS can deliver matching incoming traffic to the process.
+
+**What happens when a UDP packet is lost?** It is not retransmitted by UDP;
+the application receives no error for that particular missing datagram.
+
+**Why use JSON for telemetry?** It is readable, debuggable, and standard
+library supported, though larger and slower than binary formats.
+
+**Why can `ReadFromUDP` block?** It waits for an incoming datagram. This
+receiver uses read deadlines so cancellation is observed promptly.
+
+**How does the receiver shut down?** Context cancellation is seen after a
+short read deadline; the receive goroutine returns, closes the socket and
+output channel.
+
+**How is malformed input handled?** Decode/validation errors are logged and
+dropped, while the receive loop continues for later packets.
+
+**How does UDP integrate with channels?** The receiver translates each valid
+datagram into a typed value and sends it to a Go channel for downstream logic.
+
+**Why is network concurrency needed here?** Reads block waiting for packets,
+so a receiver goroutine permits HTTP serving and AP senders to continue.
+
+**Why is telemetry suitable for UDP?** New measurements arrive often, so an
+occasional missing sample can be superseded by the next one.
+
+**Why separate transport from monitor state?** It keeps socket parsing and
+shared-map synchronization independently testable and replaceable.
