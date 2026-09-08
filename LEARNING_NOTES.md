@@ -755,3 +755,167 @@ occasional missing sample can be superseded by the next one.
 
 **Why separate transport from monitor state?** It keeps socket parsing and
 shared-map synchronization independently testable and replaceable.
+
+## Stage 8: graceful shutdown and final project summary
+
+### Shutdown model
+
+`main` uses `signal.NotifyContext` to convert SIGINT and SIGTERM into root
+context cancellation. On either a signal or HTTP server failure, it performs
+shutdown in this order:
+
+```text
+cancel producer context -> WaitGroup.Wait
+    -> cancel receiver context -> Receiver.Done
+    -> fan-out input closes -> monitor and alert consumers finish
+    -> http.Server.Shutdown (five-second deadline)
+    -> process exits
+```
+
+Stopping producers before the receiver avoids avoidable UDP write errors during
+intentional shutdown. The receiver's 50 ms read deadline wakes `ReadFromUDP` so
+it can observe cancellation; its goroutine closes the transport channel. The
+fan-out owns and closes its two downstream channels, so `Monitor.Run` and alert
+recording exit from normal channel closure. Main waits for each completion
+signal before calling `Server.Shutdown`.
+
+`Server.Shutdown` stops new HTTP connections and waits for in-flight handlers
+up to the deadline. `Server.Close` stops listeners/connections immediately;
+it is more abrupt and remains useful only when a hard stop is required. An
+expected `http.ErrServerClosed` during shutdown is not logged as a failure.
+
+### Complete architecture and responsibilities
+
+```text
+AP config -> simulator.Next -> UDP Sender -> UDP socket -> UDP Receiver
+                                                        |
+                                                        v
+                                                 telemetry channel
+                                                        |
+                                                        v
+                                                    splitTelemetry
+                                                   /              \
+                                                  v                v
+                                          Monitor.Run        History.Record
+                                              |                   |
+                                              +----- HTTP API -----+
+```
+
+- `model`: shared AP, telemetry, and latest-state data types plus validation.
+- `simulator`: produces one realistic sample per explicit `Next` call.
+- `collector`: retains the Stage 3 in-process concurrency lesson and tests;
+  the Stage 7/8 runnable server instead uses UDP transport.
+- `transport/udp`: encodes/sends and receives/decodes UDP JSON datagrams.
+- `monitor`: owns the thread-safe latest-state map.
+- `alert`: evaluates rules and owns bounded, thread-safe alert history.
+- `api`: maps monitor/history reads to standard-library HTTP JSON handlers.
+- `cmd/server`: constructs components, owns goroutine lifecycles, and performs
+  ordered shutdown.
+
+### Full data journey
+
+For AP-01, `(*simulator.Simulator).Next` returns a `model.Telemetry`.
+`runAPSender` passes it to `(*udp.Sender).Send`, which calls `json.Marshal` and
+`UDPConn.Write`. `(*udp.Receiver).receive` gets bytes through `ReadFromUDP`,
+uses `json.Unmarshal`, calls `Telemetry.Validate`, and sends the typed value to
+its output channel. `splitTelemetry` forwards it to `(*monitor.Monitor).Run`,
+which calls `(*Monitor).Update`, and separately to `(*alert.History).Record`,
+which invokes `alert.Detect`. HTTP handlers later read the copied state through
+`Monitor.Get`/`List` and alerts through `History.List`.
+
+### Concurrency and shared state
+
+Important goroutines are AP `runAPSender` workers (created by main; ticker
+blocks; producer context ends them), the UDP receiver (created by `Start`;
+socket read/deadline blocks; receiver context ends it), fan-out (created by
+`splitTelemetry`; input receive blocks; closes downstream on source closure),
+monitor and alert consumers (created by main; receive blocks; downstream
+closure ends them), and the `net/http` serving goroutine (created by main;
+server accept blocks; `Shutdown` ends it).
+
+`Monitor.states map[string]model.APState` is protected by `Monitor.mu
+sync.RWMutex`. UDP-driven updates write it; HTTP handlers read it. `History`
+protects its bounded `[]Alert` with its own `RWMutex`; alert processing writes
+and `/alerts` reads. No handler accesses either private collection directly.
+
+Channel ownership is explicit: `Receiver.Start` creates and its receive loop
+closes the UDP telemetry channel; `splitTelemetry` creates, sends, and closes
+the monitor and alert downstream channels. The monitor and alert history only
+receive. `serverErrors` is created by main, sent by the one HTTP serve
+goroutine, and read by main; it is buffered and never needs closure.
+
+Every blocking goroutine has an exit path: ticker/select watches context;
+socket reads use a deadline and receiver context; channel sends/selects watch
+context; consumers return on channel close; `WaitGroup` waits for producers;
+and HTTP shutdown has a five-second deadline. These paths prevent known
+goroutine leaks.
+
+### Error handling and tradeoffs
+
+Malformed UDP JSON and invalid telemetry are logged/dropped while the receiver
+continues. Unknown AP telemetry is rejected by `Monitor.Update`; in the HTTP
+API, an unknown requested AP is a 404. Expected shutdown socket/context errors
+are treated as normal exit paths; unexpected server failures are logged.
+
+JSON is readable but larger/slower than protobuf; the service uses in-memory
+state rather than a database; UDP suits lossy frequent telemetry while TCP
+suits reliable commands; `RWMutex` fits read-heavy state better than routing
+every query through an owner goroutine; and `net/http` is sufficient without
+Gin for four small endpoints.
+
+### Scalability
+
+Three APs can use one goroutine and UDP sender each. Around 1,000 APs, measure
+goroutine, allocation, socket, and HTTP contention; consider shared sender
+workers, batching, bounded queues, configurable sampling, and alert-rate
+limits. Across physical machines, secure/authenticate transport, configure
+addresses, add observability, and consider a broker or durable storage when
+loss, replay, multi-consumer processing, or historical queries matter.
+
+### Final interview questions
+
+**Why use goroutines for APs?** Each AP samples independently, and Go
+goroutines model that cheaply while avoiding blocking unrelated APs.
+
+**Who closes a channel?** The component that owns all sends and knows sending
+has finished; receivers should not close producer-owned channels.
+
+**Why use a WaitGroup?** Main waits until every producer returns before it
+stops the UDP receiver, preserving shutdown order.
+
+**What does context provide?** A composable broadcast cancellation signal,
+often with deadlines, without global mutable shutdown flags.
+
+**Why use an RWMutex?** It permits concurrent HTTP reads while keeping map
+writes exclusive and safe.
+
+**What is a race condition?** Unsynchronized conflicting access to shared
+memory where at least one access writes.
+
+**Why run the race detector?** It instruments accesses and can expose missing
+locks that ordinary tests may not reliably reproduce.
+
+**UDP versus TCP?** UDP is best-effort datagrams with low overhead; TCP is a
+reliable ordered stream with more connection state.
+
+**What does socket binding do?** It registers a local IP/port so the OS can
+deliver matching incoming packets to the process.
+
+**How does HTTP serve requests concurrently?** `net/http` handles requests in
+separate concurrent execution paths, so handlers need safe dependencies.
+
+**What is graceful shutdown?** Stop accepting new work, let or bound active
+work finish, release resources, and wait for goroutines to exit.
+
+**How are malformed packets handled?** They fail JSON decoding or validation,
+are logged/dropped, and do not terminate the receiver loop.
+
+**How does backpressure work here?** Small buffered channels absorb bursts;
+when full, senders block until consumers progress or cancellation occurs.
+
+**Why keep component boundaries?** It keeps simulation, transport, state,
+alerting, and HTTP independently testable and replaceable.
+
+**What changes for 1,000 APs?** Measure first, then consider worker pools,
+bounded queues, batching, configuration, observability, and distributed
+transport/storage where required.

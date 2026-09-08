@@ -62,6 +62,7 @@ func (s *Sender) Close() error {
 type Receiver struct {
 	conn            *net.UDPConn
 	maxDatagramSize int
+	done            chan struct{}
 }
 
 // Listen binds a UDP socket to address. A port of 0 asks the OS for an
@@ -78,12 +79,17 @@ func Listen(address string, maxDatagramSize int) (*Receiver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen for UDP telemetry: %w", err)
 	}
-	return &Receiver{conn: conn, maxDatagramSize: maxDatagramSize}, nil
+	return &Receiver{conn: conn, maxDatagramSize: maxDatagramSize, done: make(chan struct{})}, nil
 }
 
 // Address returns the local address currently bound by the receiver.
 func (r *Receiver) Address() string {
 	return r.conn.LocalAddr().String()
+}
+
+// Done closes after the receive loop has released its socket and output channel.
+func (r *Receiver) Done() <-chan struct{} {
+	return r.done
 }
 
 // Start launches the receive loop and returns its output channel. The receive
@@ -95,6 +101,7 @@ func (r *Receiver) Start(ctx context.Context) <-chan model.Telemetry {
 }
 
 func (r *Receiver) receive(ctx context.Context, out chan<- model.Telemetry) {
+	defer close(r.done)
 	defer close(out)
 	defer r.conn.Close()
 

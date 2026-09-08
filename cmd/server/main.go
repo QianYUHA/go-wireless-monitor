@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,11 +25,16 @@ const (
 	serverAddress = ":8080"
 	udpAddress    = "127.0.0.1:9000"
 	alertLimit    = 100
+	shutdownGrace = 5 * time.Second
 )
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	producerCtx, cancelProducers := context.WithCancel(context.Background())
+	receiverCtx, cancelReceiver := context.WithCancel(context.Background())
+	defer cancelProducers()
+	defer cancelReceiver()
 
 	aps := []model.AP{
 		{ID: "ap-01", Name: "Lobby", Location: "Floor 1"},
@@ -56,17 +62,21 @@ func main() {
 		log.Fatal(err)
 	}
 
-	telemetry := udpReceiver.Start(ctx)
-	monitorInput, alertInput := splitTelemetry(ctx, telemetry)
-	go runMonitor(ctx, mon, monitorInput)
-	go recordAlerts(ctx, alertInput, history)
+	telemetry := udpReceiver.Start(receiverCtx)
+	monitorInput, alertInput, fanoutDone := splitTelemetry(context.Background(), telemetry)
+	monitorDone := make(chan struct{})
+	alertsDone := make(chan struct{})
+	go runMonitor(context.Background(), mon, monitorInput, monitorDone)
+	go recordAlerts(context.Background(), alertInput, history, alertsDone)
 
+	var producers sync.WaitGroup
+	producers.Add(len(simulators))
 	for _, sim := range simulators {
 		sender, err := udp.NewSender(udpAddress)
 		if err != nil {
 			log.Fatal(err)
 		}
-		go runAPSender(ctx, sim, sender, time.Second)
+		go runAPSender(producerCtx, sim, sender, time.Second, &producers)
 	}
 
 	server := &http.Server{
@@ -79,21 +89,51 @@ func main() {
 	}()
 
 	log.Printf("wireless monitor listening on %s", serverAddress)
+	serverStopped := false
 	select {
 	case err := <-serverErrors:
+		serverStopped = true
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+			log.Printf("HTTP server error: %v", err)
 		}
-	case <-ctx.Done():
-		// Stage 8 will replace Close with deadline-aware graceful shutdown.
-		if err := server.Close(); err != nil {
-			log.Printf("HTTP server close error: %v", err)
+	case <-rootCtx.Done():
+		log.Print("shutdown signal received")
+	}
+
+	// Stop sources before the UDP receiver so producers do not generate avoidable
+	// write errors against a socket that is shutting down.
+	cancelProducers()
+	producers.Wait()
+	cancelReceiver()
+	<-udpReceiver.Done()
+	<-fanoutDone
+	<-monitorDone
+	<-alertsDone
+
+	if !serverStopped {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownGrace)
+		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server shutdown error: %v", err)
 		}
+		cancelShutdown()
 		<-serverErrors
 	}
+	log.Print("shutdown complete")
 }
 
-func runAPSender(ctx context.Context, sim *simulator.Simulator, sender *udp.Sender, interval time.Duration) {
+type telemetrySender interface {
+	Send(model.Telemetry) error
+	Close() error
+}
+
+func runAPSender(
+	ctx context.Context,
+	sim *simulator.Simulator,
+	sender telemetrySender,
+	interval time.Duration,
+	producers *sync.WaitGroup,
+) {
+	defer producers.Done()
 	defer sender.Close()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -113,10 +153,12 @@ func runAPSender(ctx context.Context, sim *simulator.Simulator, sender *udp.Send
 func splitTelemetry(
 	ctx context.Context,
 	input <-chan model.Telemetry,
-) (<-chan model.Telemetry, <-chan model.Telemetry) {
+) (<-chan model.Telemetry, <-chan model.Telemetry, <-chan struct{}) {
 	monitorOutput := make(chan model.Telemetry, 16)
 	alertOutput := make(chan model.Telemetry, 16)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer close(monitorOutput)
 		defer close(alertOutput)
 		for {
@@ -140,10 +182,11 @@ func splitTelemetry(
 			}
 		}
 	}()
-	return monitorOutput, alertOutput
+	return monitorOutput, alertOutput, done
 }
 
-func runMonitor(ctx context.Context, mon *monitor.Monitor, input <-chan model.Telemetry) {
+func runMonitor(ctx context.Context, mon *monitor.Monitor, input <-chan model.Telemetry, done chan<- struct{}) {
+	defer close(done)
 	if err := mon.Run(ctx, input); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("monitor telemetry error: %v", err)
 	}
@@ -153,7 +196,9 @@ func recordAlerts(
 	ctx context.Context,
 	input <-chan model.Telemetry,
 	history *alert.History,
+	done chan<- struct{},
 ) {
+	defer close(done)
 	for {
 		select {
 		case <-ctx.Done():

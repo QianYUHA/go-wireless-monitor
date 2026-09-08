@@ -34,6 +34,7 @@ func TestSenderReceiverIntegration(t *testing.T) {
 
 	cancel()
 	waitForClosed(t, out)
+	waitForDone(t, receiver.Done())
 }
 
 func TestReceiverDiscardsInvalidPacketsAndContinues(t *testing.T) {
@@ -66,6 +67,9 @@ func TestReceiverDiscardsInvalidPacketsAndContinues(t *testing.T) {
 	if got := receiveTelemetry(t, out); got != want {
 		t.Errorf("received telemetry = %+v, want %+v", got, want)
 	}
+	cancel()
+	waitForClosed(t, out)
+	waitForDone(t, receiver.Done())
 }
 
 func TestReceiverStopsAndClosesOutputOnCancellation(t *testing.T) {
@@ -75,6 +79,7 @@ func TestReceiverStopsAndClosesOutputOnCancellation(t *testing.T) {
 	cancel()
 
 	waitForClosed(t, out)
+	waitForDone(t, receiver.Done())
 }
 
 func newReceiver(t *testing.T) *Receiver {
@@ -120,5 +125,14 @@ func waitForClosed(t *testing.T, out <-chan model.Telemetry) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for receiver output to close")
+	}
+}
+
+func waitForDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for receiver goroutine to finish")
 	}
 }
