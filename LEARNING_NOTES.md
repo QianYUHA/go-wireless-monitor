@@ -458,3 +458,123 @@ stores latest state, and the detector evaluates one telemetry value.
 **How would you extend the rules?** Add a typed alert type, threshold, and
 independent condition, or later inject thresholds through a configuration
 struct without requiring a full rule engine.
+
+## Stage 6: standard-library HTTP API
+
+### Architecture
+
+```text
+simulator.Next -> collector producer -> telemetry channel -> consumeTelemetry
+                                                            |          |
+                                                            v          v
+                                                     monitor.Update  history.Record
+                                                            |          |
+                                                            +----+-----+
+                                                                 |
+                                                           HTTP API
+                                                    /health /aps /aps/{id} /alerts
+```
+
+`cmd/server/main.go` creates three configured APs, one simulator per AP, a
+collector, monitor, bounded alert history, and HTTP handler. `consumeTelemetry`
+is the single application-level consumer: it updates the monitor then detects
+and records any alerts for the same sample.
+
+### HTTP server and routing
+
+The standard library's `net/http` supplies `Server`, `ServeMux`, request and
+response types, and concurrent request serving. Main starts `http.Server` on
+`:8080` using `ListenAndServe`. When a request arrives, the mux chooses a
+matching handler and the HTTP server runs it independently from other requests.
+
+`Handler.Routes` registers Go 1.22+ method-qualified patterns:
+
+- `GET /health`
+- `GET /aps`
+- `GET /aps/{id}`
+- `GET /alerts`
+
+The exact `/aps` pattern is distinct from `/aps/{id}`. For the latter,
+`r.PathValue("id")` extracts the standard-library path parameter. Since the
+patterns include `GET`, `ServeMux` responds with 405 for unsupported methods
+on matching paths.
+
+### Handlers and JSON
+
+`handleHealth` returns `{"status":"ok"}` with 200. `handleAPs` calls
+`Monitor.List` and returns all state values with 200. `handleAP` calls
+`Monitor.Get`; it returns an AP state with 200 or a JSON error with 404.
+`handleAlerts` calls `History.List` and returns recent alerts with 200.
+
+`writeJSON` encodes values using `encoding/json` into a buffer before sending
+headers. This allows an actual encoding failure to become 500 before a
+response is committed. Successful responses set `Content-Type:
+application/json`, write the desired status, then write the encoded body.
+JSON tags on Stage 1 models determine field names such as `ap_id` and
+`latency_ms` in these responses.
+
+### Concurrency and alert history
+
+`net/http` can run several handlers concurrently. A telemetry goroutine may
+call `Monitor.Update` with `Lock` while request A calls `Get` with `RLock` and
+request B calls `List` with `RLock`; the monitor's `RWMutex` coordinates them.
+Handlers add no redundant lock.
+
+`alert.History` is new shared state. It owns a bounded `[]Alert`, protected by
+its own `RWMutex`. `consumeTelemetry` writes through `Record`/`Add`; HTTP
+handlers read through `List`. When the configured maximum is exceeded, `Add`
+discards oldest entries and keeps the newest alerts. `List` returns a copied
+slice so handlers cannot mutate stored history.
+
+### HTTP request lifecycle
+
+For `GET /aps/ap-02`: a client uses an HTTP request over a TCP connection; the
+`net/http` server accepts it and passes it to `ServeMux`; the `GET /aps/{id}`
+handler reads `id` via `PathValue`; `Monitor.Get("ap-02")` obtains `RLock` and
+copies its `APState`; the handler encodes the copy as JSON and sends a 200 HTTP
+response. Unknown IDs instead produce a 404 JSON error. Internal errors are
+not exposed verbatim, avoiding leakage of implementation details.
+
+### Testing and lifecycle
+
+`httptest.NewRequest` and `httptest.NewRecorder` invoke the router entirely in
+memory, so tests need no listener on port 8080. They verify status codes,
+content type, and JSON bodies for all endpoints, including 404 and 405.
+
+Main cancels the collector and consumer on SIGINT/SIGTERM and closes the HTTP
+server. Stage 8 will add deadline-aware `Server.Shutdown` and coordinated
+waiting; that fuller graceful-shutdown work is intentionally deferred.
+
+### Stage 6 interview questions
+
+**How does Go handle concurrent HTTP requests?** `net/http` serves requests
+concurrently, so handlers must treat shared dependencies as concurrent.
+
+**What is a handler?** A function or object that receives `ResponseWriter` and
+`Request`, performs application work, and writes an HTTP response.
+
+**Why use JSON tags?** They define stable external field names without tying
+the API format to Go's exported field naming.
+
+**Why use 404 for an unknown AP?** The requested resource does not exist in
+the configured monitor state.
+
+**What is dependency injection here?** Main constructs monitor and history,
+then passes them into `api.NewHandler` rather than using global variables.
+
+**What does `httptest` provide?** In-memory requests and recorders for testing
+handlers without binding a real TCP port.
+
+**How do HTTP and TCP relate?** HTTP defines request/response semantics at the
+application layer; the server usually carries those messages over TCP.
+
+**Why are API reads thread-safe?** Handlers call monitor methods that use
+`RWMutex`; they never access the map directly.
+
+**Why should handlers not access maps directly?** It would bypass locking,
+encapsulation, validation rules, and future storage changes.
+
+**Why choose standard `net/http` over a framework?** This API is small and
+needs only routing and JSON. A framework can help with larger applications,
+middleware ecosystems, or advanced binding, but adds concepts unnecessary
+for this project.
