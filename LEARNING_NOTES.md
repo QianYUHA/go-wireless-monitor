@@ -363,3 +363,98 @@ interact through `Update`, `Get`, and `List`.
 
 **Why not return the map directly?** A caller could mutate it without locking,
 bypass validation, and create races or corrupt monitor state.
+
+## Stage 5: stateless alert detection
+
+### Architecture
+
+```text
+collector --> telemetry --> monitor --> latest AP state --> future API
+                 |
+                 +-------> alert.Detect --> []alert.Alert --> future API/history
+```
+
+Alert detection is independent in this stage. A future application coordinator
+can give the same validated telemetry sample to both the monitor and detector.
+The monitor remains responsible only for latest state; it does not yet own an
+alert-history collection.
+
+### Alert model
+
+`Alert` contains the AP ID, typed `AlertType`, typed `Severity`, message,
+observed numeric value, threshold, and the telemetry timestamp. The types are
+easy to serialize later because they have underlying type `string`.
+
+`AlertWeakSignal`, `AlertHighLatency`, and `AlertHighPacketLoss` are typed
+constants, not arbitrary string literals scattered through callers. Typed
+constants prevent accidental mixing of unrelated string values and make the
+public API self-documenting. Weak signal and high latency are warnings; high
+packet loss is marked critical in this initial policy.
+
+### Detector and validation
+
+`alert.Detect(telemetry) ([]Alert, error)` is a stateless function. It calls
+`Telemetry.Validate` itself, returning no alerts and an error for invalid
+input. Monitor validation also protects its own boundary, but the detector is
+an independently callable component, so validating here prevents malformed
+telemetry from becoming a misleading alert. The small duplicate validation
+cost is preferable to relying on every future caller to remember it.
+
+Each rule is an independent `if`, so one valid sample can append zero through
+three alerts. The detector allocates a fresh result slice for every call and
+keeps no history or mutable package state, making concurrent calls naturally
+safe and requiring no mutex.
+
+### Threshold behavior
+
+- RSSI triggers only when `RSSI < -70`; exactly `-70` does not alert.
+- Latency triggers only when `LatencyMS > 100`; exactly `100` does not alert.
+- Loss triggers only when `PacketLossPct > 5`; exactly `5` does not alert.
+
+The `Alert.Timestamp` is the telemetry timestamp, which identifies when the
+condition was observed rather than when the detector happened to execute.
+
+### Data journey
+
+For AP-02 with RSSI -82 dBm, latency 140 ms, and loss 7%, `alert.Detect`
+validates the sample then appends a weak-signal alert, a high-latency alert,
+and a high-packet-loss alert. Each has AP ID `ap-02`, its rule-specific type,
+the observed value, its threshold, and the sample timestamp.
+
+### Design tradeoffs
+
+Thresholds are private constants to keep the current learning project obvious
+and avoid configuration parsing. A later configuration struct or file could
+inject thresholds into a detector. We do not add a rule engine because three
+fixed numeric comparisons do not justify dynamic rule registration, complex
+state, or additional failure modes.
+
+### Stage 5 interview questions
+
+**What is a stateless service?** It retains no request-specific or historical
+data between calls. It is simpler to test and naturally safe for concurrent
+use when its inputs are values.
+
+**Why use typed constants?** They constrain intended values, make APIs clear,
+and avoid repeatedly writing arbitrary strings that can contain typos.
+
+**Why are threshold operators strict?** The policy says only values beyond the
+limit are abnormal, so equality must remain healthy and tests protect that
+boundary.
+
+**Can one event create multiple alerts?** Yes. Metrics represent independent
+conditions, so every violated rule emits its own explanatory alert.
+
+**Why validate in the detector when the monitor validates too?** The detector
+is usable independently; validating at its public boundary prevents invalid
+input from producing alert output.
+
+**Who owns alert history?** No component does in Stage 5. Detection returns
+values, and a later API/application layer can choose a bounded history policy.
+
+**How are responsibilities separated?** The collector schedules, the monitor
+stores latest state, and the detector evaluates one telemetry value.
+
+**How would you extend the rules?** Add a typed alert type, threshold, and
+independent condition, or later inject thresholds through a configuration
+struct without requiring a full rule engine.
